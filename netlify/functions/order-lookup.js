@@ -27,8 +27,9 @@
 
 const CRM_BASE_URL = "https://bss.omanbroadband.om";
 
+// Updated login path to match the actual login page URL
 const LOGIN_LOGOUT_PATH = "/crm/logOut";
-const LOGIN_PATH = "/crm/login";
+const LOGIN_PATH = "/crm/";                // ← changed from "/crm/login"
 const AUTH_SUCCESS_PATH = "/crm/authSuccess";
 const ORDER_PATH = "/crm/viewOrderDetails_New";
 
@@ -60,10 +61,6 @@ exports.handler = async function (event) {
 
     const orderId = String(rawOrderId).trim();
 
-    /*
-     * Order IDs must remain strings.
-     * This is important because an Order ID may contain leading zeroes.
-     */
     if (!/^\d+$/.test(orderId)) {
       return jsonResponse(400, {
         success: false,
@@ -73,7 +70,6 @@ exports.handler = async function (event) {
 
     if (!process.env.CRM_USERNAME || !process.env.CRM_PASSWORD) {
       console.error("[order-lookup] CRM credentials are not configured.");
-
       return jsonResponse(500, {
         success: false,
         error: "CRM is not configured correctly."
@@ -122,7 +118,6 @@ exports.handler = async function (event) {
       console.log(
         `[order-lookup] Order ${orderId} was not found in CRM response.`
       );
-
       return jsonResponse(404, {
         success: false,
         error: "Order not found. Please check the Order ID."
@@ -156,16 +151,13 @@ exports.handler = async function (event) {
 };
 
 /* =========================================================
-   CRM SESSION (REVISED)
+   CRM SESSION (UPDATED)
 ========================================================= */
 
 async function createCrmSession() {
   /*
-   * REVISED: Start by requesting the login page (GET /crm/login)
-   * to obtain the initial session cookies and CSRF token.
-   * The previous approach of calling /crm/logOut first caused a 401.
+   * GET the login page (now at /crm/) to obtain session cookies and CSRF token.
    */
-
   const url = CRM_BASE_URL + LOGIN_PATH;
 
   const response = await fetchWithTimeout(
@@ -190,7 +182,17 @@ async function createCrmSession() {
     ` cookies=${cookies.length > 0}`
   );
 
-  // Follow redirects (e.g., to a different login page)
+  // If we get a 401, log the response body for debugging
+  if (response.status === 401) {
+    const body = await response.text();
+    console.error("[order-lookup] Login page 401 body:", body);
+    const error = new Error("CRM login page returned 401 – check the endpoint or your IP.");
+    error.code = "CRM_LOGIN_PAGE_401";
+    error.statusCode = 502;
+    throw error;
+  }
+
+  // Follow redirects if any
   if (isRedirect(response.status) && location) {
     const redirectUrl = new URL(location, CRM_BASE_URL).toString();
 
@@ -245,16 +247,7 @@ async function createCrmSession() {
     return { cookies, csrf: csrf || null };
   }
 
-  // Handle unexpected status codes
-  if (response.status === 401) {
-    const error = new Error(
-      "CRM login page returned 401 – check the endpoint or your IP."
-    );
-    error.code = "CRM_LOGIN_PAGE_401";
-    error.statusCode = 502;
-    throw error;
-  }
-
+  // Handle other error statuses
   if (response.status >= 400) {
     const error = new Error(
       `CRM login page returned HTTP ${response.status}.`
@@ -271,55 +264,43 @@ async function createCrmSession() {
 }
 
 /* =========================================================
-   CRM LOGIN
+   CRM LOGIN (UPDATED)
 ========================================================= */
 
 async function loginToCrm(session) {
   /*
-   * The CRM login request captured from the browser is:
-   *
-   * POST /crm/login
-   *
-   * application/x-www-form-urlencoded
+   * POST login credentials to the same URL (/crm/).
+   * The form action is often empty or the same page.
    */
-
   const username = process.env.CRM_USERNAME;
   const password = process.env.CRM_PASSWORD;
 
   const form = new URLSearchParams();
 
-  /*
-   * Dynamic CSRF.
-   */
   if (session.csrf) {
     form.append("_csrf", session.csrf);
   }
 
-  /*
-   * Values observed from the browser login request.
-   */
+  // Observed login form fields – adjust if needed
   form.append(
     "featureId",
     "<fmt:message key='login.featureid'/>"
   );
-
   form.append(
     "targetPage",
     "/common/authenticateResp.jsp"
   );
-
   form.append("sessionChk", "false");
   form.append("GuiLanguage", "null");
   form.append("locationId", "");
   form.append("locationName", "");
-
   form.append("username", username);
   form.append("password_ui", "");
   form.append("password", password);
   form.append("otp", "");
 
   const response = await fetchWithTimeout(
-    CRM_BASE_URL + LOGIN_PATH,
+    CRM_BASE_URL + LOGIN_PATH,   // POST to the same URL
     {
       method: "POST",
       redirect: "manual",
@@ -518,7 +499,6 @@ async function fetchOrder(session, orderId) {
     (location ? ` redirect=${location}` : "")
   );
 
-  // Check for redirect to login (session expired)
   if (isRedirect(response.status) && location) {
     const redirectUrl = new URL(location, CRM_BASE_URL).toString();
     if (/login|auth/i.test(redirectUrl)) {
@@ -592,13 +572,11 @@ function extractOrder(data, requestedOrderId) {
 
   if (!rows.length) return null;
 
-  // Find the specific order
   let row = rows.find((item) => {
     const value = item?.orderId ?? item?.order_id ?? item?.id;
     return value !== undefined && String(value).trim() === requestedOrderId;
   });
 
-  // Fallback to first row if only one is returned
   if (!row && rows.length === 1) row = rows[0];
 
   if (!row) return null;
@@ -765,7 +743,6 @@ function jsonResponse(statusCode, body) {
 
 function browserHeaders(options = {}) {
   const headers = {
-    // Updated to a modern Chrome User-Agent
     "User-Agent":
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
     "Accept-Language": "en-US,en;q=0.9",
