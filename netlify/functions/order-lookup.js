@@ -1,443 +1,1407 @@
 /**
- * netlify/functions/order-lookup.js
+ * ATAAD ORDER LOOKUP
  *
- * Server-side only. Handles:
- *   1. Logging into the Oman Broadband CRM (bss.omanbroadband.om)
- *   2. Maintaining the CRM session (cookies) for a single request lifecycle
- *   3. Looking up an order by ID
- *   4. Returning ONLY the sanitized fields the frontend needs
+ * Netlify Function
  *
- * IMPORTANT — READ THIS FIRST
- * ----------------------------------------------------------------------
- * This function was built from a description of CRM requests captured via
- * browser DevTools, not from a live integration test against the CRM.
- * The exact HTML structure of the login page (where the CSRF token lives),
- * the exact set of hidden/session fields required for login, and the exact
- * shape of the viewOrderDetails_New JSON response were not fully knowable
- * without direct access to the CRM.
+ * Flow:
+ * Browser
+ *   -> Netlify Function
+ *   -> Oman Broadband CRM
+ *   -> Login/session
+ *   -> viewOrderDetails_New
+ *   -> formatted order details
  *
- * Every CRM-specific detail that may need adjusting once you test against
- * the real CRM is isolated in the CONFIG object and the three functions:
- *   - fetchLoginPage()
- *   - performLogin()
- *   - lookupOrder()
- * You should not need to touch any other file to fix a CRM integration
- * mismatch — everything CRM-specific lives in this one file.
- * ----------------------------------------------------------------------
+ * Required Netlify environment variables:
+ *
+ * CRM_USERNAME
+ * CRM_PASSWORD
+ *
+ * Optional environment variables for CRM order-search parameters:
+ *
+ * CRM_CONTRACTOR_ID
+ * CRM_USER_ID
+ * CRM_ROLE_ID
+ * CRM_MVNO_ID
+ * CRM_TEAM_ID
  */
 
-const CRM_BASE = "https://bss.omanbroadband.om";
-const LOGIN_PAGE_PATH = "/crm/login";
-const LOGIN_SUBMIT_PATH = "/crm/login";
-const ORDER_LOOKUP_PATH = "/crm/viewOrderDetails_New";
+const CRM_BASE_URL = "https://bss.omanbroadband.om";
 
-const REQUEST_TIMEOUT_MS = 15000;
+const LOGIN_LOGOUT_PATH = "/crm/logOut";
+const LOGIN_PATH = "/crm/login";
+const AUTH_SUCCESS_PATH = "/crm/authSuccess";
+const ORDER_PATH = "/crm/viewOrderDetails_New";
 
-// ---------------------------------------------------------------------
-// CONFIG — adjust here if the CRM's real request/response shape differs
-// from what was captured in DevTools.
-// ---------------------------------------------------------------------
-const CONFIG = {
-  // Static/default values observed in the login form. Adjust if your
-  // CRM account uses different location/language defaults.
-  loginDefaults: {
-    featureId: "",
-    targetPage: "",
-    sessionChk: "",
-    GuiLanguage: "en",
-    locationId: "",
-    locationName: "",
-    otp: ""
-  },
+const REQUEST_TIMEOUT_MS = 30000;
 
-  // Regex patterns used to pull the CSRF token out of the login page HTML.
-  // Adjust these if the CRM's login page markup differs.
-  csrfPatterns: [
-    /name=["']_csrf["']\s+(?:id=["'][^"']*["']\s+)?value=["']([^"']+)["']/i,
-    /<meta\s+name=["']_csrf["']\s+content=["']([^"']+)["']/i,
-    /"_csrf"\s*:\s*"([^"]+)"/i
-  ],
+/* ---------------------------------------------------------
+   MAIN HANDLER
+--------------------------------------------------------- */
 
-  // Fields the order-lookup POST is expected to need beyond order_id.
-  // These are typically returned from the authenticated session
-  // (e.g. embedded in the post-login page or an initial CRM API call)
-  // rather than being fixed values — extend fetchSessionContext() below
-  // if your CRM exposes them via a specific endpoint.
-  orderLookupExtraFields: ["contractorId", "userId", "roleId", "mvnoId", "teamId"]
-};
-
-// ---------------------------------------------------------------------
-// Minimal cookie jar (request-scoped only — never persisted, never
-// returned to the browser, never written to disk/database).
-// ---------------------------------------------------------------------
-class CookieJar {
-  constructor() {
-    this.cookies = new Map();
-  }
-
-  storeFromResponse(response) {
-    const raw = typeof response.headers.raw === "function"
-      ? response.headers.raw()["set-cookie"] || []
-      : response.headers.get("set-cookie")
-        ? [response.headers.get("set-cookie")]
-        : [];
-
-    for (const cookieStr of raw) {
-      const [pair] = cookieStr.split(";");
-      const eqIdx = pair.indexOf("=");
-      if (eqIdx === -1) continue;
-      const name = pair.slice(0, eqIdx).trim();
-      const value = pair.slice(eqIdx + 1).trim();
-      if (name) this.cookies.set(name, value);
-    }
-  }
-
-  header() {
-    return Array.from(this.cookies.entries())
-      .map(([k, v]) => `${k}=${v}`)
-      .join("; ");
-  }
-
-  get(name) {
-    return this.cookies.get(name);
-  }
-}
-
-// ---------------------------------------------------------------------
-// Networking helper with timeout
-// ---------------------------------------------------------------------
-async function timedFetch(url, options = {}) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  try {
-    return await fetch(url, { ...options, signal: controller.signal, redirect: "manual" });
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-// ---------------------------------------------------------------------
-// Step 1: Load the login page to get an initial session cookie + CSRF token
-// ---------------------------------------------------------------------
-async function fetchLoginPage(jar) {
-  const response = await timedFetch(`${CRM_BASE}${LOGIN_PAGE_PATH}`, {
-    method: "GET",
-    headers: {
-      "User-Agent": "Mozilla/5.0 (compatible; AtaadOrderLookup/1.0)",
-      Accept: "text/html,application/xhtml+xml"
-    }
-  });
-
-  jar.storeFromResponse(response);
-
-  if (!response.ok && response.status !== 302) {
-    throw new CrmError("CRM_UNAVAILABLE", `Login page returned status ${response.status}`);
-  }
-
-  const html = await response.text();
-
-  let csrfToken = null;
-  for (const pattern of CONFIG.csrfPatterns) {
-    const match = html.match(pattern);
-    if (match) {
-      csrfToken = match[1];
-      break;
-    }
-  }
-
-  if (!csrfToken) {
-    throw new CrmError(
-      "CSRF_NOT_FOUND",
-      "Could not locate a CSRF token on the CRM login page. The login page markup may have changed — update csrfPatterns in netlify/functions/order-lookup.js."
-    );
-  }
-
-  return { csrfToken };
-}
-
-// ---------------------------------------------------------------------
-// Step 2: Submit the login form using credentials from environment
-// variables (never from the frontend/request body).
-// ---------------------------------------------------------------------
-async function performLogin(jar, csrfToken) {
-  const username = process.env.CRM_USERNAME;
-  const password = process.env.CRM_PASSWORD;
-
-  if (!username || !password) {
-    throw new CrmError(
-      "CONFIG_MISSING",
-      "CRM_USERNAME / CRM_PASSWORD environment variables are not configured."
-    );
-  }
-
-  const body = new URLSearchParams({
-    _csrf: csrfToken,
-    featureId: CONFIG.loginDefaults.featureId,
-    targetPage: CONFIG.loginDefaults.targetPage,
-    sessionChk: CONFIG.loginDefaults.sessionChk,
-    GuiLanguage: CONFIG.loginDefaults.GuiLanguage,
-    locationId: CONFIG.loginDefaults.locationId,
-    locationName: CONFIG.loginDefaults.locationName,
-    username,
-    password_ui: password,
-    password,
-    otp: CONFIG.loginDefaults.otp
-  });
-
-  let response = await timedFetch(`${CRM_BASE}${LOGIN_SUBMIT_PATH}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      "X-Requested-With": "XMLHttpRequest",
-      Cookie: jar.header(),
-      "User-Agent": "Mozilla/5.0 (compatible; AtaadOrderLookup/1.0)"
-    },
-    body: body.toString()
-  });
-
-  jar.storeFromResponse(response);
-
-  // Follow the redirect to /crm/authSuccess if the CRM responds with one.
-  let hopCount = 0;
-  while ([301, 302, 303, 307, 308].includes(response.status) && hopCount < 5) {
-    const location = response.headers.get("location");
-    if (!location) break;
-    const nextUrl = location.startsWith("http") ? location : `${CRM_BASE}${location}`;
-    response = await timedFetch(nextUrl, {
-      method: "GET",
-      headers: {
-        Cookie: jar.header(),
-        "User-Agent": "Mozilla/5.0 (compatible; AtaadOrderLookup/1.0)"
-      }
-    });
-    jar.storeFromResponse(response);
-    hopCount += 1;
-  }
-
-  if (!jar.get("JSESSIONID")) {
-    throw new CrmError("LOGIN_FAILED", "CRM login did not establish an authenticated session.");
-  }
-
-  return true;
-}
-
-// ---------------------------------------------------------------------
-// Step 3: Look up the order using the authenticated session.
-// ---------------------------------------------------------------------
-async function lookupOrder(jar, orderId, csrfToken) {
-  const body = new URLSearchParams({
-    order_id: orderId
-  });
-
-  // Extra session-derived fields the CRM's own frontend sends. These are
-  // not secrets, but they vary by logged-in user/role, so we do not
-  // hard-code real values — only include them if present via env config
-  // for the CRM account being used. Leave unset if your CRM account does
-  // not require them (single-tenant setups typically don't).
-  for (const field of CONFIG.orderLookupExtraFields) {
-    const envKey = `CRM_${field.replace(/([A-Z])/g, "_$1").toUpperCase()}`;
-    if (process.env[envKey]) {
-      body.append(field, process.env[envKey]);
-    }
-  }
-
-  const response = await timedFetch(`${CRM_BASE}${ORDER_LOOKUP_PATH}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      "X-Requested-With": "XMLHttpRequest",
-      "X-CSRF-TOKEN": csrfToken,
-      Cookie: jar.header(),
-      "User-Agent": "Mozilla/5.0 (compatible; AtaadOrderLookup/1.0)",
-      Accept: "application/json"
-    },
-    body: body.toString()
-  });
-
-  jar.storeFromResponse(response);
-
-  if (response.status === 401 || response.status === 403) {
-    throw new CrmError("SESSION_EXPIRED", "CRM session was rejected during order lookup.");
-  }
-
-  if (!response.ok) {
-    throw new CrmError("CRM_UNAVAILABLE", `Order lookup returned status ${response.status}`);
-  }
-
-  let data;
-  try {
-    data = await response.json();
-  } catch (e) {
-    throw new CrmError("PARSE_ERROR", "CRM order lookup response was not valid JSON.");
-  }
-
-  return data;
-}
-
-// ---------------------------------------------------------------------
-// Field extraction — pulls only the fields we need, tolerant of the
-// order record being nested under a wrapper key (e.g. { data: {...} }
-// or { result: {...} }), which is common for this kind of CRM endpoint.
-// ---------------------------------------------------------------------
-function extractOrderFields(raw) {
-  const candidates = [raw, raw && raw.data, raw && raw.result, raw && raw.order];
-  const source = candidates.find((c) => c && typeof c === "object" && !Array.isArray(c)) || {};
-
-  // Some CRMs return a single-element array of matches.
-  const record = Array.isArray(source) ? source[0] : source;
-  const src = record && typeof record === "object" ? record : {};
-
-  const pick = (...keys) => {
-    for (const key of keys) {
-      if (src[key] !== undefined && src[key] !== null && String(src[key]).trim() !== "") {
-        return String(src[key]).trim();
-      }
-    }
-    return "";
-  };
-
-  return {
-    orderId: pick("orderId", "order_id"),
-    rlRefreneceNo: pick("rlRefreneceNo", "rlReferenceNo", "rl_reference_no"),
-    customerName: pick("customerName", "customer_name"),
-    contactNumber: pick("contactNumber", "contact_number"),
-    geoTag: pick("geoTag", "geo_tag"),
-    createDate: pick("createDate", "create_date"),
-    currentStage: pick("currentStage", "current_stage", "status"),
-    customerPhoneOther: pick("customerPhoneOther", "customer_phone_other"),
-    propertyType: pick("propertyType", "property_type"),
-    auditPopName: pick("auditPopName", "audit_pop_name"),
-    auditRlNotes: pick("auditRlNotes", "audit_rl_notes")
-  };
-}
-
-function isOrderFound(order, rawResponse) {
-  // Treat as "not found" if we couldn't extract even a basic identifier
-  // and the CRM didn't otherwise indicate success.
-  if (order.orderId || order.customerName || order.currentStage) return true;
-  if (rawResponse && rawResponse.found === false) return false;
-  return false;
-}
-
-function formatWhatsAppText(order) {
-  const lines = ["*ORDER DETAILS*", ""];
-
-  const add = (label, value) => {
-    if (value && String(value).trim() !== "") lines.push(`${label}: ${value}`);
-  };
-
-  add("Order ID", order.orderId);
-  add("RL Reference", order.rlRefreneceNo);
-  lines.push("");
-  add("Customer", order.customerName);
-  add("Contact", order.contactNumber);
-  add("Other Phone", order.customerPhoneOther);
-  lines.push("");
-  add("GeoTag", order.geoTag);
-  add("Created", order.createDate);
-  lines.push("");
-  add("Status", order.currentStage);
-  add("Property Type", order.propertyType);
-  add("POP", order.auditPopName);
-
-  if (order.auditRlNotes) {
-    lines.push("");
-    lines.push("RL Notes:");
-    lines.push(order.auditRlNotes);
-  }
-
-  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
-}
-
-// ---------------------------------------------------------------------
-// Error type carrying a safe, user-facing code
-// ---------------------------------------------------------------------
-class CrmError extends Error {
-  constructor(code, technicalMessage) {
-    super(technicalMessage);
-    this.code = code;
-  }
-}
-
-const USER_MESSAGES = {
-  INVALID_ORDER_ID: "Please enter a valid numeric Order ID.",
-  CONFIG_MISSING: "CRM login failed. Please check the configured CRM credentials.",
-  LOGIN_FAILED: "CRM login failed. Please check the configured CRM credentials.",
-  CSRF_NOT_FOUND: "Unable to connect to CRM. Please try again later.",
-  SESSION_EXPIRED: "Unable to connect to CRM. Please try again later.",
-  CRM_UNAVAILABLE: "CRM is currently unavailable. Please try again later.",
-  PARSE_ERROR: "Unable to read the order details. Please try again.",
-  NOT_FOUND: "Order not found. Please check the Order ID and try again.",
-  TIMEOUT: "CRM is taking too long to respond. Please try again.",
-  UNKNOWN: "Unable to read the order details. Please try again."
-};
-
-function safeMessageFor(code) {
-  return USER_MESSAGES[code] || USER_MESSAGES.UNKNOWN;
-}
-
-// ---------------------------------------------------------------------
-// Handler
-// ---------------------------------------------------------------------
-exports.handler = async (event) => {
+exports.handler = async function (event) {
   if (event.httpMethod !== "POST") {
-    return jsonResponse(405, { success: false, message: "Method not allowed." });
+    return jsonResponse(405, {
+      success: false,
+      error: "Method not allowed."
+    });
   }
-
-  let orderId;
-  try {
-    const body = JSON.parse(event.body || "{}");
-    orderId = typeof body.orderId === "string" ? body.orderId.trim() : "";
-  } catch (e) {
-    return jsonResponse(400, { success: false, message: safeMessageFor("INVALID_ORDER_ID") });
-  }
-
-  if (!orderId || !/^[0-9]+$/.test(orderId)) {
-    return jsonResponse(400, { success: false, message: safeMessageFor("INVALID_ORDER_ID") });
-  }
-
-  const jar = new CookieJar();
 
   try {
-    const { csrfToken } = await fetchLoginPage(jar);
-    await performLogin(jar, csrfToken);
+    const body = safeJsonParse(event.body);
 
-    // Some CRMs issue a fresh CSRF token post-login for subsequent API
-    // calls. Re-use the login CSRF token by default; if your CRM requires
-    // a distinct post-login token, fetch it here and pass it into
-    // lookupOrder instead.
-    const rawResult = await lookupOrder(jar, orderId, csrfToken);
-    const order = extractOrderFields(rawResult);
+    const rawOrderId = body && body.orderId;
 
-    if (!isOrderFound(order, rawResult)) {
-      return jsonResponse(200, { success: false, message: safeMessageFor("NOT_FOUND") });
+    if (rawOrderId === undefined || rawOrderId === null) {
+      return jsonResponse(400, {
+        success: false,
+        error: "Order ID is required."
+      });
     }
 
-    const formattedText = formatWhatsAppText(order);
+    const orderId = String(rawOrderId).trim();
+
+    /*
+     * Order IDs must remain strings.
+     * This is important because an Order ID may contain leading zeroes.
+     */
+    if (!/^\d+$/.test(orderId)) {
+      return jsonResponse(400, {
+        success: false,
+        error: "Please enter a valid numeric Order ID."
+      });
+    }
+
+    if (!process.env.CRM_USERNAME || !process.env.CRM_PASSWORD) {
+      console.error("[order-lookup] CRM credentials are not configured.");
+
+      return jsonResponse(500, {
+        success: false,
+        error: "CRM is not configured correctly."
+      });
+    }
+
+    console.log(`[order-lookup] Starting lookup for Order ID ${orderId}`);
+
+    /*
+     * -----------------------------------------------------
+     * STEP 1
+     * Establish CRM session and obtain login/CSRF information
+     * -----------------------------------------------------
+     */
+
+    const session = await createCrmSession();
+
+    /*
+     * -----------------------------------------------------
+     * STEP 2
+     * Login
+     * -----------------------------------------------------
+     */
+
+    await loginToCrm(session);
+
+    /*
+     * -----------------------------------------------------
+     * STEP 3
+     * Search order
+     * -----------------------------------------------------
+     */
+
+    const crmResult = await fetchOrder(session, orderId);
+
+    /*
+     * -----------------------------------------------------
+     * STEP 4
+     * Parse CRM response
+     * -----------------------------------------------------
+     */
+
+    const order = extractOrder(crmResult, orderId);
+
+    if (!order) {
+      console.log(
+        `[order-lookup] Order ${orderId} was not found in CRM response.`
+      );
+
+      return jsonResponse(404, {
+        success: false,
+        error: "Order not found. Please check the Order ID."
+      });
+    }
+
+    const formattedText = formatForWhatsApp(order);
+
+    console.log(`[order-lookup] Order ${orderId} found successfully.`);
 
     return jsonResponse(200, {
       success: true,
       order,
       formattedText
     });
-  } catch (err) {
-    // Log full technical detail server-side only. Never log the password;
-    // credentials are never included in these error objects.
-    const code = err instanceof CrmError ? err.code : "UNKNOWN";
-    console.error(`[order-lookup] ${code}:`, err && err.message ? err.message : err);
 
-    if (err && err.name === "AbortError") {
-      return jsonResponse(504, { success: false, message: safeMessageFor("TIMEOUT") });
-    }
+  } catch (error) {
+    console.error(
+      "[order-lookup] ERROR:",
+      sanitizeErrorMessage(error)
+    );
 
-    return jsonResponse(200, { success: false, message: safeMessageFor(code) });
+    return jsonResponse(
+      error.statusCode || 502,
+      {
+        success: false,
+        error: getSafeUserMessage(error)
+      }
+    );
   }
 };
 
-function jsonResponse(statusCode, bodyObj) {
+
+/* =========================================================
+   CRM SESSION
+========================================================= */
+
+async function createCrmSession() {
+  /*
+   * The browser flow showed /crm/logOut as the Referer
+   * before POST /crm/login.
+   *
+   * We first request /crm/logOut to establish the same
+   * initial CRM session instead of assuming GET /crm/login
+   * is a public login page.
+   */
+
+  const url = CRM_BASE_URL + LOGIN_LOGOUT_PATH;
+
+  const response = await fetchWithTimeout(
+    url,
+    {
+      method: "GET",
+      redirect: "manual",
+      headers: browserHeaders({
+        accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+      })
+    },
+    REQUEST_TIMEOUT_MS
+  );
+
+  const cookies = extractCookies(response);
+
+  const location = response.headers.get("location");
+
+  console.log(
+    `[order-lookup] Initial CRM request: ${response.status}` +
+    (location ? ` redirect=${location}` : "") +
+    ` cookies=${cookies.length > 0}`
+  );
+
+  /*
+   * Some applications redirect /crm/logOut to the login page.
+   * If that happens, follow the redirect manually while
+   * preserving cookies.
+   */
+
+  if (isRedirect(response.status) && location) {
+    const redirectUrl = new URL(location, CRM_BASE_URL).toString();
+
+    const redirectResponse = await fetchWithTimeout(
+      redirectUrl,
+      {
+        method: "GET",
+        redirect: "manual",
+        headers: browserHeaders({
+          referer: url,
+          accept:
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          cookie: cookies.join("; ")
+        })
+      },
+      REQUEST_TIMEOUT_MS
+    );
+
+    const redirectCookies = extractCookies(redirectResponse);
+
+    const allCookies = mergeCookies(
+      cookies,
+      redirectCookies
+    );
+
+    const html = await redirectResponse.text();
+
+    console.log(
+      `[order-lookup] CRM redirect response: ${redirectResponse.status}` +
+      ` content-type=${redirectResponse.headers.get("content-type") || ""}` +
+      ` length=${html.length}`
+    );
+
+    const csrf =
+      extractCsrf(html) ||
+      redirectResponse.headers.get("X-CSRF-TOKEN") ||
+      redirectResponse.headers.get("X-CSRF-TOKEN".toLowerCase());
+
+    return {
+      cookies: allCookies,
+      csrf: csrf || null
+    };
+  }
+
+  const html = await response.text();
+
+  console.log(
+    `[order-lookup] CRM initial response: ${response.status}` +
+    ` content-type=${response.headers.get("content-type") || ""}` +
+    ` length=${html.length}`
+  );
+
+  /*
+   * Try to find CSRF in the response HTML.
+   */
+  const csrf =
+    extractCsrf(html) ||
+    response.headers.get("X-CSRF-TOKEN") ||
+    response.headers.get("X-CSRF-TOKEN".toLowerCase());
+
+  /*
+   * A 401 here means the CRM is rejecting server-side access
+   * before credentials are even submitted.
+   */
+  if (response.status === 401) {
+    const error = new Error(
+      "CRM initial session request returned HTTP 401."
+    );
+
+    error.code = "CRM_INITIAL_401";
+    error.statusCode = 502;
+
+    throw error;
+  }
+
+  if (response.status >= 400) {
+    const error = new Error(
+      `CRM initial session request returned HTTP ${response.status}.`
+    );
+
+    error.statusCode = 502;
+
+    throw error;
+  }
+
+  return {
+    cookies,
+    csrf: csrf || null
+  };
+}
+
+
+/* =========================================================
+   CRM LOGIN
+========================================================= */
+
+async function loginToCrm(session) {
+  /*
+   * The CRM login request captured from the browser is:
+   *
+   * POST /crm/login
+   *
+   * application/x-www-form-urlencoded
+   */
+
+  const username = process.env.CRM_USERNAME;
+  const password = process.env.CRM_PASSWORD;
+
+  const form = new URLSearchParams();
+
+  /*
+   * Dynamic CSRF.
+   */
+  if (session.csrf) {
+    form.append("_csrf", session.csrf);
+  }
+
+  /*
+   * Values observed from the browser login request.
+   */
+  form.append(
+    "featureId",
+    "<fmt:message key='login.featureid'/>"
+  );
+
+  form.append(
+    "targetPage",
+    "/common/authenticateResp.jsp"
+  );
+
+  form.append("sessionChk", "false");
+  form.append("GuiLanguage", "null");
+  form.append("locationId", "");
+  form.append("locationName", "");
+
+  form.append("username", username);
+
+  /*
+   * The browser request contains password_ui and password.
+   * Keep password_ui empty unless the CRM specifically requires
+   * a value.
+   */
+  form.append("password_ui", "");
+  form.append("password", password);
+
+  /*
+   * OTP was observed as empty.
+   */
+  form.append("otp", "");
+
+  const response = await fetchWithTimeout(
+    CRM_BASE_URL + LOGIN_PATH,
+    {
+      method: "POST",
+      redirect: "manual",
+
+      headers: browserHeaders({
+        referer: CRM_BASE_URL + LOGIN_LOGOUT_PATH,
+        origin: CRM_BASE_URL,
+        contentType:
+          "application/x-www-form-urlencoded",
+        accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        cookie: session.cookies.join("; "),
+        csrf: session.csrf
+      }),
+
+      body: form.toString()
+    },
+    REQUEST_TIMEOUT_MS
+  );
+
+  const loginCookies = extractCookies(response);
+
+  session.cookies = mergeCookies(
+    session.cookies,
+    loginCookies
+  );
+
+  const location = response.headers.get("location");
+
+  console.log(
+    `[order-lookup] CRM login response: ${response.status}` +
+    (location ? ` redirect=${location}` : "")
+  );
+
+  /*
+   * Normal successful browser login was observed as:
+   *
+   * POST /crm/login
+   *       ↓
+   * 302
+   *       ↓
+   * /crm/authSuccess
+   */
+
+  if (response.status === 401 || response.status === 403) {
+    const error = new Error(
+      `CRM login rejected with HTTP ${response.status}.`
+    );
+
+    error.code = "CRM_LOGIN_REJECTED";
+    error.statusCode = 502;
+
+    throw error;
+  }
+
+  if (isRedirect(response.status) && location) {
+    await followAuthenticationRedirect(
+      session,
+      location
+    );
+
+    return;
+  }
+
+  /*
+   * Some servers may return 200 with an authentication page.
+   */
+  if (response.status === 200) {
+    const text = await response.text();
+
+    /*
+     * Do not log response body because it may contain
+     * sensitive information.
+     */
+
+    if (
+      /login/i.test(text) &&
+      /password/i.test(text) &&
+      !/authSuccess/i.test(text)
+    ) {
+      const error = new Error(
+        "CRM login did not establish an authenticated session."
+      );
+
+      error.code = "CRM_LOGIN_NOT_AUTHENTICATED";
+      error.statusCode = 502;
+
+      throw error;
+    }
+
+    return;
+  }
+
+  const error = new Error(
+    `Unexpected CRM login response: HTTP ${response.status}.`
+  );
+
+  error.statusCode = 502;
+
+  throw error;
+}
+
+
+/* =========================================================
+   AUTH REDIRECT
+========================================================= */
+
+async function followAuthenticationRedirect(
+  session,
+  location
+) {
+  let currentUrl = new URL(
+    location,
+    CRM_BASE_URL
+  ).toString();
+
+  /*
+   * Follow a small number of redirects manually.
+   */
+  for (let i = 0; i < 5; i++) {
+    const response = await fetchWithTimeout(
+      currentUrl,
+      {
+        method: "GET",
+        redirect: "manual",
+
+        headers: browserHeaders({
+          referer: CRM_BASE_URL + LOGIN_PATH,
+          accept:
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          cookie: session.cookies.join("; "),
+          csrf: session.csrf
+        })
+      },
+      REQUEST_TIMEOUT_MS
+    );
+
+    const newCookies = extractCookies(response);
+
+    session.cookies = mergeCookies(
+      session.cookies,
+      newCookies
+    );
+
+    const nextLocation =
+      response.headers.get("location");
+
+    console.log(
+      `[order-lookup] CRM auth redirect ${i + 1}: ${response.status}` +
+      (nextLocation
+        ? ` -> ${nextLocation}`
+        : "")
+    );
+
+    if (isRedirect(response.status) && nextLocation) {
+      currentUrl = new URL(
+        nextLocation,
+        currentUrl
+      ).toString();
+
+      continue;
+    }
+
+    if (response.status >= 400) {
+      const error = new Error(
+        `CRM authentication redirect returned HTTP ${response.status}.`
+      );
+
+      error.statusCode = 502;
+
+      throw error;
+    }
+
+    return;
+  }
+
+  const error = new Error(
+    "CRM authentication redirect loop."
+  );
+
+  error.statusCode = 502;
+
+  throw error;
+}
+
+
+/* =========================================================
+   ORDER LOOKUP
+========================================================= */
+
+async function fetchOrder(session, orderId) {
+  /*
+   * These values come from the CRM request payload you supplied.
+   *
+   * Environment variables are supported for values that may
+   * be different for your CRM account.
+   */
+
+  const contractorId =
+    process.env.CRM_CONTRACTOR_ID || "117";
+
+  const userId =
+    process.env.CRM_USER_ID || "1583";
+
+  const roleId =
+    process.env.CRM_ROLE_ID || "93";
+
+  const mvnoId =
+    process.env.CRM_MVNO_ID || "200";
+
+  const teamId =
+    process.env.CRM_TEAM_ID || "51";
+
+  const form = new URLSearchParams();
+
+  /*
+   * DataTables/search parameters observed in the CRM request.
+   */
+  form.append("draw", "1");
+  form.append("start", "0");
+  form.append("length", "10");
+
+  form.append("languageId", "1");
+
+  form.append(
+    "pageName",
+    "ADVANCED_SEARCH_ORDER_MANAGEMENT"
+  );
+
+  form.append("order_type", "");
+  form.append("roleForOm", "false");
+
+  /*
+   * IMPORTANT:
+   * Keep order ID as a string.
+   */
+  form.append("order_id", orderId);
+
+  form.append("gis_tag", "");
+  form.append("posId", "");
+
+  form.append("startDate", "");
+  form.append("endDate", "");
+
+  form.append("rowCount", "10");
+  form.append("perPageCount", "10");
+
+  form.append("userPosition", "49");
+
+  form.append("rl_reference_no", "");
+  form.append("requesting_licensee", "");
+
+  form.append("MVNORequired", "true");
+
+  form.append("end_user_type", "");
+
+  form.append("contractorId", contractorId);
+  form.append("contractorType", "");
+
+  form.append("userId", userId);
+  form.append("roleId", roleId);
+  form.append("mvnoId", mvnoId);
+  form.append("teamId", teamId);
+
+  /*
+   * If the actual browser payload contains additional
+   * parameters, add them here.
+   */
+
+  const response = await fetchWithTimeout(
+    CRM_BASE_URL + ORDER_PATH,
+    {
+      method: "POST",
+
+      /*
+       * Do not automatically follow redirects here.
+       * If the CRM redirects to login, we want to detect it.
+       */
+      redirect: "manual",
+
+      headers: browserHeaders({
+        referer:
+          CRM_BASE_URL + AUTH_SUCCESS_PATH,
+
+        origin: CRM_BASE_URL,
+
+        accept:
+          "application/json, text/javascript, */*; q=0.01",
+
+        contentType:
+          "application/x-www-form-urlencoded; charset=UTF-8",
+
+        requestedWith:
+          "XMLHttpRequest",
+
+        cookie:
+          session.cookies.join("; "),
+
+        csrf:
+          session.csrf
+      }),
+
+      body: form.toString()
+    },
+
+    REQUEST_TIMEOUT_MS
+  );
+
+  const cookies = extractCookies(response);
+
+  session.cookies = mergeCookies(
+    session.cookies,
+    cookies
+  );
+
+  const contentType =
+    response.headers.get("content-type") || "";
+
+  const location =
+    response.headers.get("location");
+
+  console.log(
+    `[order-lookup] CRM order response: ${response.status}` +
+    ` content-type=${contentType}` +
+    ` length=${response.headers.get("content-length") || "unknown"}` +
+    (location ? ` redirect=${location}` : "")
+  );
+
+  /*
+   * If CRM sends us back to login, the session did not work.
+   */
+  if (
+    response.status === 301 ||
+    response.status === 302 ||
+    response.status === 303 ||
+    response.status === 307 ||
+    response.status === 308
+  ) {
+    const redirectUrl = location
+      ? new URL(location, CRM_BASE_URL).toString()
+      : "";
+
+    if (
+      redirectUrl &&
+      /login|auth/i.test(redirectUrl)
+    ) {
+      const error = new Error(
+        "CRM session was not authenticated."
+      );
+
+      error.code = "CRM_SESSION_EXPIRED";
+      error.statusCode = 502;
+
+      throw error;
+    }
+  }
+
+  if (response.status === 401 || response.status === 403) {
+    const error = new Error(
+      `CRM order request returned HTTP ${response.status}.`
+    );
+
+    error.code = "CRM_ORDER_AUTH_ERROR";
+    error.statusCode = 502;
+
+    throw error;
+  }
+
+  if (response.status >= 500) {
+    const error = new Error(
+      `CRM server returned HTTP ${response.status}.`
+    );
+
+    error.code = "CRM_SERVER_ERROR";
+    error.statusCode = 502;
+
+    throw error;
+  }
+
+  if (response.status >= 400) {
+    const error = new Error(
+      `CRM order request returned HTTP ${response.status}.`
+    );
+
+    error.statusCode = 502;
+
+    throw error;
+  }
+
+  const text = await response.text();
+
+  if (!text) {
+    const error = new Error(
+      "CRM returned an empty response."
+    );
+
+    error.statusCode = 502;
+
+    throw error;
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch (parseError) {
+    console.error(
+      `[order-lookup] CRM returned non-JSON response. ` +
+      `content-type=${contentType} length=${text.length}`
+    );
+
+    const error = new Error(
+      "CRM returned an unexpected response."
+    );
+
+    error.code = "CRM_NON_JSON_RESPONSE";
+    error.statusCode = 502;
+
+    throw error;
+  }
+}
+
+
+/* =========================================================
+   RESPONSE PARSING
+========================================================= */
+
+function extractOrder(data, requestedOrderId) {
+  if (!data) {
+    return null;
+  }
+
+  /*
+   * The CRM may return DataTables-style data:
+   *
+   * {
+   *   data: [...]
+   * }
+   *
+   * or another wrapper.
+   */
+
+  let rows = [];
+
+  if (Array.isArray(data.data)) {
+    rows = data.data;
+  } else if (Array.isArray(data.aaData)) {
+    rows = data.aaData;
+  } else if (Array.isArray(data.rows)) {
+    rows = data.rows;
+  } else if (Array.isArray(data)) {
+    rows = data;
+  }
+
+  if (!rows.length) {
+    return null;
+  }
+
+  /*
+   * Find the requested order where possible.
+   */
+  let row = rows.find((item) => {
+    const value =
+      item &&
+      (
+        item.orderId ??
+        item.order_id ??
+        item.id
+      );
+
+    return (
+      value !== undefined &&
+      String(value).trim() === requestedOrderId
+    );
+  });
+
+  /*
+   * If the CRM only returned one row and does not expose
+   * orderId in the expected property, use the first row.
+   */
+  if (!row && rows.length === 1) {
+    row = rows[0];
+  }
+
+  if (!row) {
+    return null;
+  }
+
+  return normalizeOrder(row, requestedOrderId);
+}
+
+
+/* =========================================================
+   NORMALIZE ORDER
+========================================================= */
+
+function normalizeOrder(row, requestedOrderId) {
+  /*
+   * Keep the CRM's actual field names where known.
+   * Multiple fallback names are included so small CRM
+   * response changes don't immediately break the app.
+   */
+
+  return {
+    orderId:
+      firstValue(
+        row.orderId,
+        row.order_id,
+        row.orderID,
+        requestedOrderId
+      ),
+
+    rlRefreneceNo:
+      firstValue(
+        row.rlRefreneceNo,
+        row.rlReferenceNo,
+        row.rl_reference_no,
+        row.rlReferenceNumber
+      ),
+
+    customerName:
+      firstValue(
+        row.customerName,
+        row.endUserName,
+        row.end_user_name
+      ),
+
+    contactNumber:
+      firstValue(
+        row.contactNumber,
+        row.contact_number,
+        row.mobileNumber,
+        row.customerPhone
+      ),
+
+    geoTag:
+      firstValue(
+        row.geoTag,
+        row.geo_tag,
+        row.gisTag,
+        row.gis_tag
+      ),
+
+    createDate:
+      firstValue(
+        row.createDate,
+        row.create_date,
+        row.createdDate
+      ),
+
+    currentStage:
+      firstValue(
+        row.currentStage,
+        row.current_stage,
+        row.orderStatus,
+        row.order_status
+      ),
+
+    customerPhoneOther:
+      firstValue(
+        row.customerPhoneOther,
+        row.customer_phone_other,
+        row.otherPhone
+      ),
+
+    propertyType:
+      firstValue(
+        row.propertyType,
+        row.property_type
+      ),
+
+    auditPopName:
+      firstValue(
+        row.auditPopName,
+        row.audit_pop_name,
+        row.popName,
+        row.pop
+      ),
+
+    auditRlNotes:
+      firstValue(
+        row.auditRlNotes,
+        row.audit_rl_notes,
+        row.rlNotes,
+        row.rl_notes
+      )
+  };
+}
+
+
+/* =========================================================
+   WHATSAPP FORMAT
+========================================================= */
+
+function formatForWhatsApp(order) {
+  const lines = [];
+
+  lines.push("*ORDER DETAILS*");
+  lines.push("");
+
+  addLine(lines, "Order ID", order.orderId);
+  addLine(
+    lines,
+    "RL Reference",
+    order.rlRefreneceNo
+  );
+
+  lines.push("");
+
+  addLine(
+    lines,
+    "Customer",
+    order.customerName
+  );
+
+  addLine(
+    lines,
+    "Contact",
+    order.contactNumber
+  );
+
+  addLine(
+    lines,
+    "Other Phone",
+    order.customerPhoneOther
+  );
+
+  lines.push("");
+
+  addLine(
+    lines,
+    "GeoTag",
+    order.geoTag
+  );
+
+  addLine(
+    lines,
+    "Created",
+    order.createDate
+  );
+
+  lines.push("");
+
+  addLine(
+    lines,
+    "Status",
+    order.currentStage
+  );
+
+  addLine(
+    lines,
+    "Property Type",
+    order.propertyType
+  );
+
+  addLine(
+    lines,
+    "POP",
+    order.auditPopName
+  );
+
+  if (hasValue(order.auditRlNotes)) {
+    lines.push("");
+    lines.push("RL Notes:");
+    lines.push(String(order.auditRlNotes).trim());
+  }
+
+  return lines.join("\n").trim();
+}
+
+
+/* =========================================================
+   HELPERS
+========================================================= */
+
+function addLine(lines, label, value) {
+  if (!hasValue(value)) {
+    return;
+  }
+
+  lines.push(
+    `${label}: ${String(value).trim()}`
+  );
+}
+
+
+function firstValue(...values) {
+  for (const value of values) {
+    if (hasValue(value)) {
+      return value;
+    }
+  }
+
+  return "";
+}
+
+
+function hasValue(value) {
+  return (
+    value !== undefined &&
+    value !== null &&
+    String(value).trim() !== ""
+  );
+}
+
+
+function safeJsonParse(value) {
+  if (!value) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(value);
+  } catch (error) {
+    const e = new Error(
+      "Invalid request."
+    );
+
+    e.statusCode = 400;
+
+    throw e;
+  }
+}
+
+
+function jsonResponse(statusCode, body) {
   return {
     statusCode,
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(bodyObj)
+
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+
+      "Cache-Control":
+        "no-store, no-cache, must-revalidate, proxy-revalidate",
+
+      "Pragma": "no-cache",
+
+      "Expires": "0",
+
+      "Access-Control-Allow-Origin": "*",
+
+      "Access-Control-Allow-Headers":
+        "Content-Type",
+
+      "Access-Control-Allow-Methods":
+        "POST, OPTIONS"
+    },
+
+    body: JSON.stringify(body)
   };
+}
+
+
+function browserHeaders(options = {}) {
+  const headers = {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 Firefox/153.0",
+
+    "Accept-Language":
+      "en-US,en;q=0.9",
+
+    "Cache-Control":
+      "no-cache",
+
+    "Pragma":
+      "no-cache",
+
+    "DNT":
+      "1"
+  };
+
+  if (options.accept) {
+    headers["Accept"] = options.accept;
+  }
+
+  if (options.referer) {
+    headers["Referer"] = options.referer;
+  }
+
+  if (options.origin) {
+    headers["Origin"] = options.origin;
+  }
+
+  if (options.contentType) {
+    headers["Content-Type"] =
+      options.contentType;
+  }
+
+  if (options.requestedWith) {
+    headers["X-Requested-With"] =
+      options.requestedWith;
+  }
+
+  if (options.cookie) {
+    headers["Cookie"] =
+      options.cookie;
+  }
+
+  if (options.csrf) {
+    headers["X-CSRF-TOKEN"] =
+      options.csrf;
+  }
+
+  return headers;
+}
+
+
+/* =========================================================
+   COOKIE HELPERS
+========================================================= */
+
+function extractCookies(response) {
+  /*
+   * Node/Netlify fetch implementations may expose multiple
+   * Set-Cookie headers differently.
+   *
+   * Try getSetCookie() first when available.
+   */
+
+  let rawCookies = [];
+
+  if (
+    response.headers &&
+    typeof response.headers.getSetCookie === "function"
+  ) {
+    rawCookies =
+      response.headers.getSetCookie();
+  } else {
+    const single =
+      response.headers.get("set-cookie");
+
+    if (single) {
+      /*
+       * Most environments return a combined string.
+       * Split conservatively around comma + cookie name.
+       */
+      rawCookies =
+        splitSetCookieHeader(single);
+    }
+  }
+
+  return rawCookies
+    .map((cookie) => {
+      return cookie
+        .split(";")[0]
+        .trim();
+    })
+    .filter(Boolean);
+}
+
+
+function splitSetCookieHeader(header) {
+  /*
+   * Split only when the comma is followed by what looks
+   * like a new cookie name.
+   */
+  return header.split(
+    /,(?=[^;,=\s]+=[^;,]+)/
+  );
+}
+
+
+function mergeCookies(...cookieArrays) {
+  const map = new Map();
+
+  for (const cookies of cookieArrays) {
+    for (const cookie of cookies || []) {
+      const separator =
+        cookie.indexOf("=");
+
+      if (separator === -1) {
+        continue;
+      }
+
+      const name =
+        cookie.substring(0, separator);
+
+      map.set(name, cookie);
+    }
+  }
+
+  return Array.from(map.values());
+}
+
+
+/* =========================================================
+   CSRF EXTRACTION
+========================================================= */
+
+function extractCsrf(html) {
+  if (!html) {
+    return null;
+  }
+
+  const patterns = [
+    /*
+     * <input name="_csrf" value="...">
+     */
+    /name=["']_csrf["'][^>]*value=["']([^"']+)["']/i,
+
+    /value=["']([^"']+)["'][^>]*name=["']_csrf["']/i,
+
+    /*
+     * JavaScript variables.
+     */
+    /["']_csrf["']\s*[:=]\s*["']([^"']+)["']/i,
+
+    /csrfToken\s*[:=]\s*["']([^"']+)["']/i,
+
+    /csrf_token\s*[:=]\s*["']([^"']+)["']/i
+  ];
+
+  for (const pattern of patterns) {
+    const match =
+      html.match(pattern);
+
+    if (
+      match &&
+      match[1] &&
+      match[1].trim()
+    ) {
+      return match[1].trim();
+    }
+  }
+
+  return null;
+}
+
+
+/* =========================================================
+   FETCH WITH TIMEOUT
+========================================================= */
+
+async function fetchWithTimeout(
+  url,
+  options,
+  timeoutMs
+) {
+  const controller =
+    new AbortController();
+
+  const timer =
+    setTimeout(
+      () => controller.abort(),
+      timeoutMs
+    );
+
+  try {
+    return await fetch(
+      url,
+      {
+        ...options,
+        signal: controller.signal
+      }
+    );
+  } catch (error) {
+    if (error.name === "AbortError") {
+      const timeoutError =
+        new Error(
+          "CRM request timed out."
+        );
+
+      timeoutError.code =
+        "CRM_TIMEOUT";
+
+      timeoutError.statusCode =
+        504;
+
+      throw timeoutError;
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+
+/* =========================================================
+   RESPONSE / ERROR HELPERS
+========================================================= */
+
+function isRedirect(status) {
+  return (
+    status === 301 ||
+    status === 302 ||
+    status === 303 ||
+    status === 307 ||
+    status === 308
+  );
+}
+
+
+function sanitizeErrorMessage(error) {
+  if (!error) {
+    return "Unknown error";
+  }
+
+  return String(
+    error.message || error
+  )
+    .replace(
+      /password\s*[:=]\s*[^\s,;]+/gi,
+      "password=[REDACTED]"
+    )
+    .replace(
+      /username\s*[:=]\s*[^\s,;]+/gi,
+      "username=[REDACTED]"
+    )
+    .replace(
+      /JSESSIONID=[^;\s]+/gi,
+      "JSESSIONID=[REDACTED]"
+    )
+    .replace(
+      /X-CSRF-TOKEN[^,\s]*/gi,
+      "X-CSRF-TOKEN=[REDACTED]"
+    );
+}
+
+
+function getSafeUserMessage(error) {
+  if (!error) {
+    return "CRM is currently unavailable. Please try again later.";
+  }
+
+  switch (error.code) {
+    case "CRM_TIMEOUT":
+      return "CRM is taking too long to respond. Please try again.";
+
+    case "CRM_INITIAL_401":
+      return "CRM rejected the server connection. Please try again later.";
+
+    case "CRM_LOGIN_REJECTED":
+      return "CRM login was rejected. Please check the CRM configuration.";
+
+    case "CRM_LOGIN_NOT_AUTHENTICATED":
+      return "CRM login could not be completed. Please try again later.";
+
+    case "CRM_SESSION_EXPIRED":
+      return "CRM session could not be established. Please try again.";
+
+    case "CRM_ORDER_AUTH_ERROR":
+      return "CRM authentication failed while searching the order.";
+
+    case "CRM_SERVER_ERROR":
+      return "CRM is currently unavailable. Please try again later.";
+
+    case "CRM_NON_JSON_RESPONSE":
+      return "CRM returned an unexpected response. Please try again.";
+
+    default:
+      return "CRM is currently unavailable. Please try again later.";
+  }
 }
