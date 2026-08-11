@@ -1,0 +1,9 @@
+{
+  "name": "ataad-order-lookup",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Mobile-first PWA for looking up Oman Broadband CRM orders and copying details for WhatsApp.",
+  "engines": {
+    "node": ">=18"
+  }
+}

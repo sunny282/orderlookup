@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+  <title>ATAAD Order Lookup</title>
+
+  <!-- PWA -->
+  <link rel="manifest" href="/manifest.json" />
+  <meta name="theme-color" content="#0f172a" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="ATAAD Lookup" />
+  <link rel="apple-touch-icon" href="/icons/icon-192.png" />
+  <link rel="icon" href="/icons/icon-192.png" />
+
+  <link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+
+  <div class="app">
+
+    <header class="app-header">
+      <h1>ATAAD ORDER LOOKUP</h1>
+      <p class="subtitle">Oman Broadband CRM · Order Details</p>
+    </header>
+
+    <!-- Install banner (shown only when beforeinstallprompt fires) -->
+    <div id="install-banner" class="install-banner hidden">
+      <div>
+        <strong>Install ATAAD Order Lookup</strong>
+        <p>Add this app to your phone for quick access.</p>
+      </div>
+      <div class="install-banner-actions">
+        <button id="install-btn" class="btn btn-secondary btn-small">📱 INSTALL APP</button>
+        <button id="install-dismiss" class="btn btn-text btn-small">Maybe later</button>
+      </div>
+    </div>
+
+    <main class="card">
+      <label class="field-label" for="order-id">Enter Order ID</label>
+      <input
+        id="order-id"
+        class="input"
+        type="text"
+        inputmode="numeric"
+        pattern="[0-9]*"
+        placeholder="e.g. 02575111"
+        autocomplete="off"
+        autocapitalize="off"
+        spellcheck="false"
+      />
+      <div id="input-error" class="error-text hidden"></div>
+
+      <button id="search-btn" class="btn btn-primary">SEARCH ORDER</button>
+
+      <div id="status" class="status hidden"></div>
+    </main>
+
+    <section id="result-section" class="card hidden">
+      <h2 class="result-heading">ORDER DETAILS</h2>
+
+      <textarea id="result-text" class="result-textarea" readonly></textarea>
+
+      <button id="copy-btn" class="btn btn-primary">📋 COPY DETAILS</button>
+      <div id="copy-confirm" class="copy-confirm hidden">✓ Details copied!</div>
+
+      <button id="clear-btn" class="btn btn-outline">CLEAR</button>
+    </section>
+
+    <footer class="app-footer">
+      <span>Ataad · Internal Tool</span>
+    </footer>
+  </div>
+
+  <script src="/js/app.js"></script>
+</body>
+</html>
