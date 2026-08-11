@@ -1,263 +1,131 @@
-(() => {
-  "use strict";
+/**
+ * ATAAD Order Lookup – Frontend
+ *
+ * API endpoint: your laptop server via Cloudflare Tunnel
+ */
 
-  // ---------- Element refs ----------
-  const orderInput = document.getElementById("order-id");
-  const inputError = document.getElementById("input-error");
-  const searchBtn = document.getElementById("search-btn");
-  const statusEl = document.getElementById("status");
+// ─── API ENDPOINT ──────────────────────────────────────────
+const API_URL = 'https://chrome-feeling-henry-gear.trycloudflare.com/api/lookup';
 
-  const resultSection = document.getElementById("result-section");
-  const resultText = document.getElementById("result-text");
-  const copyBtn = document.getElementById("copy-btn");
-  const copyConfirm = document.getElementById("copy-confirm");
-  const clearBtn = document.getElementById("clear-btn");
+// ─── DOM REFS ──────────────────────────────────────────────
+const orderInput = document.getElementById('orderId');
+const searchBtn = document.getElementById('searchBtn');
+const resultDiv = document.getElementById('result');
+const copyBtn = document.getElementById('copyBtn');
+const loadingEl = document.getElementById('loading');
 
-  const installBanner = document.getElementById("install-banner");
-  const installBtn = document.getElementById("install-btn");
-  const installDismiss = document.getElementById("install-dismiss");
+// ─── HELPERS ──────────────────────────────────────────────
+function showLoading(show) {
+  if (loadingEl) loadingEl.style.display = show ? 'block' : 'none';
+}
 
-  const LAST_ORDER_KEY = "ataad_last_order_id";
-  let isSearching = false;
+function showResult(html) {
+  if (resultDiv) resultDiv.innerHTML = html;
+}
 
-  // ---------- Init ----------
-  window.addEventListener("DOMContentLoaded", () => {
-    orderInput.focus();
+function showError(msg) {
+  showResult(`<div class="error">❌ ${msg}</div>`);
+}
 
-    try {
-      const lastId = localStorage.getItem(LAST_ORDER_KEY);
-      if (lastId) orderInput.value = lastId;
-    } catch (e) {
-      /* localStorage may be unavailable in some contexts; ignore */
-    }
-  });
+function showSuccess(data) {
+  // Format the response nicely
+  const formatted = data.formattedText || 'No details available.';
+  // Convert newlines to <br> for HTML display
+  const html = formatted.replace(/\n/g, '<br>');
+  showResult(`<div class="success">✅ Order found!</div><div class="details">${html}</div>`);
+  // Store the raw text for copy
+  window._copyText = formatted;
+}
 
-  // ---------- Validation ----------
-  function validateOrderId(value) {
-    const trimmed = value.trim();
-    if (!trimmed) return { valid: false, message: "Please enter an Order ID." };
-    if (!/^[0-9]+$/.test(trimmed)) {
-      return { valid: false, message: "Please enter a valid numeric Order ID." };
-    }
-    return { valid: true, value: trimmed };
+// ─── SEARCH ──────────────────────────────────────────────
+async function searchOrder() {
+  const orderId = orderInput.value.trim();
+  if (!orderId) {
+    showError('Please enter an Order ID.');
+    return;
+  }
+  if (!/^\d+$/.test(orderId)) {
+    showError('Please enter a valid numeric Order ID.');
+    return;
   }
 
-  // ---------- Status helpers ----------
-  function setStatus(message, type) {
-    statusEl.textContent = message;
-    statusEl.className = "status " + type;
-    statusEl.classList.remove("hidden");
-  }
+  showLoading(true);
+  showResult('');
 
-  function clearStatus() {
-    statusEl.classList.add("hidden");
-    statusEl.textContent = "";
-  }
-
-  function showInputError(message) {
-    inputError.textContent = message;
-    inputError.classList.remove("hidden");
-  }
-
-  function clearInputError() {
-    inputError.classList.add("hidden");
-    inputError.textContent = "";
-  }
-
-  // ---------- WhatsApp text formatting ----------
-  // Mirrors the server-side formatting fields; server sends already-formatted
-  // text, but we keep this as a fallback formatter in case the backend
-  // returns raw fields instead of pre-formatted text.
-  function formatOrderText(order) {
-    const lines = [];
-    lines.push("*ORDER DETAILS*");
-    lines.push("");
-
-    const pushIfPresent = (label, value) => {
-      if (value !== undefined && value !== null && String(value).trim() !== "") {
-        lines.push(`${label}: ${value}`);
-      }
-    };
-
-    pushIfPresent("Order ID", order.orderId);
-    pushIfPresent("RL Reference", order.rlRefreneceNo);
-    lines.push("");
-    pushIfPresent("Customer", order.customerName);
-    pushIfPresent("Contact", order.contactNumber);
-    pushIfPresent("Other Phone", order.customerPhoneOther);
-    lines.push("");
-    pushIfPresent("GeoTag", order.geoTag);
-    pushIfPresent("Created", order.createDate);
-    lines.push("");
-    pushIfPresent("Status", order.currentStage);
-    pushIfPresent("Property Type", order.propertyType);
-    pushIfPresent("POP", order.auditPopName);
-
-    if (order.auditRlNotes && String(order.auditRlNotes).trim() !== "") {
-      lines.push("");
-      lines.push("RL Notes:");
-      lines.push(order.auditRlNotes);
-    }
-
-    // Collapse accidental triple blank lines from empty sections
-    return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
-  }
-
-  // ---------- Search ----------
-  async function searchOrder() {
-    if (isSearching) return;
-
-    clearInputError();
-    clearStatus();
-    resultSection.classList.add("hidden");
-
-    const check = validateOrderId(orderInput.value);
-    if (!check.valid) {
-      showInputError(check.message);
-      return;
-    }
-
-    isSearching = true;
-    searchBtn.disabled = true;
-    setStatus("Searching CRM...", "info");
-
-    try {
-      const response = await fetch("/.netlify/functions/order-lookup", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ orderId: check.value })
-      });
-
-      let payload;
-      try {
-        payload = await response.json();
-      } catch (e) {
-        payload = null;
-      }
-
-      if (!response.ok || !payload || payload.success !== true) {
-        const message = (payload && payload.message) || "Unable to read the order details. Please try again.";
-        setStatus(message, "error");
-        return;
-      }
-
-      setStatus("Order found ✓", "success");
-
-      const text = payload.formattedText || formatOrderText(payload.order || {});
-      resultText.value = text;
-      resultSection.classList.remove("hidden");
-      copyConfirm.classList.add("hidden");
-
-      try {
-        localStorage.setItem(LAST_ORDER_KEY, check.value);
-      } catch (e) {
-        /* ignore storage errors */
-      }
-    } catch (networkErr) {
-      setStatus("Unable to connect to CRM. Please try again later.", "error");
-    } finally {
-      isSearching = false;
-      searchBtn.disabled = false;
-    }
-  }
-
-  searchBtn.addEventListener("click", searchOrder);
-
-  orderInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      searchOrder();
-    }
-  });
-
-  orderInput.addEventListener("input", () => {
-    clearInputError();
-  });
-
-  // ---------- Copy ----------
-  async function copyDetails() {
-    const text = resultText.value;
-    if (!text) return;
-
-    try {
-      if (navigator.clipboard && window.isSecureContext) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        fallbackCopy(text);
-      }
-      showCopyConfirm();
-    } catch (e) {
-      // Clipboard API can fail in some in-app browsers; fall back to manual select
-      try {
-        fallbackCopy(text);
-        showCopyConfirm();
-      } catch (e2) {
-        setStatus("Could not copy automatically. Please select and copy the text manually.", "error");
-      }
-    }
-  }
-
-  function fallbackCopy(text) {
-    resultText.removeAttribute("readonly");
-    resultText.focus();
-    resultText.select();
-    resultText.setSelectionRange(0, text.length);
-    const ok = document.execCommand("copy");
-    resultText.setAttribute("readonly", "true");
-    window.getSelection().removeAllRanges();
-    if (!ok) throw new Error("execCommand copy failed");
-  }
-
-  function showCopyConfirm() {
-    copyConfirm.classList.remove("hidden");
-    setTimeout(() => copyConfirm.classList.add("hidden"), 2500);
-  }
-
-  copyBtn.addEventListener("click", copyDetails);
-
-  // ---------- Clear ----------
-  clearBtn.addEventListener("click", () => {
-    orderInput.value = "";
-    orderInput.focus();
-    resultSection.classList.add("hidden");
-    resultText.value = "";
-    clearStatus();
-    clearInputError();
-    copyConfirm.classList.add("hidden");
-  });
-
-  // ---------- PWA install prompt ----------
-  let deferredPrompt = null;
-
-  window.addEventListener("beforeinstallprompt", (e) => {
-    e.preventDefault();
-    deferredPrompt = e;
-    installBanner.classList.remove("hidden");
-  });
-
-  installBtn.addEventListener("click", async () => {
-    if (!deferredPrompt) return;
-    installBanner.classList.add("hidden");
-    deferredPrompt.prompt();
-    await deferredPrompt.userChoice;
-    deferredPrompt = null;
-  });
-
-  installDismiss.addEventListener("click", () => {
-    installBanner.classList.add("hidden");
-  });
-
-  window.addEventListener("appinstalled", () => {
-    installBanner.classList.add("hidden");
-    deferredPrompt = null;
-  });
-
-  // ---------- Service worker registration ----------
-  if ("serviceWorker" in navigator) {
-    window.addEventListener("load", () => {
-      navigator.serviceWorker.register("/service-worker.js").catch(() => {
-        /* non-fatal: app still works without offline caching */
-      });
+  try {
+    const response = await fetch(API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orderId })
     });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(data.error || `Server returned ${response.status}`);
+    }
+
+    if (data.success && data.order) {
+      showSuccess(data);
+    } else {
+      showError(data.error || 'Order not found.');
+    }
+  } catch (err) {
+    console.error('[app] Error:', err);
+    showError('Could not reach the server. Please try again later.');
+  } finally {
+    showLoading(false);
   }
-})();
+}
+
+// ─── COPY ──────────────────────────────────────────────────
+async function copyDetails() {
+  const text = window._copyText;
+  if (!text) {
+    alert('No details to copy. Search for an order first.');
+    return;
+  }
+
+  try {
+    await navigator.clipboard.writeText(text);
+    alert('✅ Details copied to clipboard!');
+  } catch {
+    // Fallback for older browsers
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    document.body.appendChild(textarea);
+    textarea.select();
+    try {
+      document.execCommand('copy');
+      alert('✅ Details copied to clipboard!');
+    } catch {
+      alert('Could not copy. Please select and copy manually.');
+    }
+    document.body.removeChild(textarea);
+  }
+}
+
+// ─── EVENT LISTENERS ──────────────────────────────────────
+searchBtn.addEventListener('click', searchOrder);
+copyBtn.addEventListener('click', copyDetails);
+
+// Allow Enter key on input
+orderInput.addEventListener('keypress', (e) => {
+  if (e.key === 'Enter') searchOrder();
+});
+
+// Optionally load last searched order from localStorage
+const lastOrder = localStorage.getItem('lastOrder');
+if (lastOrder) {
+  orderInput.value = lastOrder;
+}
+
+// Save last order on successful search (optional)
+const originalShowSuccess = showSuccess;
+showSuccess = function(data) {
+  localStorage.setItem('lastOrder', orderInput.value.trim());
+  originalShowSuccess(data);
+};
+
+// ─── INIT ──────────────────────────────────────────────────
+console.log('[app] Ready. API endpoint:', API_URL);
